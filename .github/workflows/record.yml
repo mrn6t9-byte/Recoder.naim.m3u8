@@ -13,12 +13,11 @@ on:
         description: "Stop the job when the stream sends no data for N minutes (saves GitHub minutes, 0 = off)"
         default: "10"
       stream_type:
-        description: "Link type: auto (finds out itself), hls (.m3u8), dash (.mpd) or ts (direct MPEG-TS stream)"
+        description: "Link type: auto (finds out itself), hls (.m3u8) or ts (direct MPEG-TS stream)"
         type: choice
         options:
           - auto
           - hls
-          - dash
           - ts
         default: auto
       quality:
@@ -43,10 +42,6 @@ on:
         default: "0"
       referer:
         description: "Optional: website the link is played on (only if the link needs it)"
-        required: false
-        default: ""
-      key:
-        description: "Optional: content key from the source (32 hex characters or kid:key). Better: save it as the secret DRM_KEY and leave this empty"
         required: false
         default: ""
 
@@ -75,7 +70,6 @@ jobs:
       PART_MB: ${{ inputs.part_mb }}
       PART_MIN: ${{ inputs.part_min }}
       REFERER: ${{ inputs.referer }}
-      KEY: ${{ inputs.key || secrets.DRM_KEY }}
       OUT_DIR: /mnt/rec
       MP4_DIR: rec_mp4
     steps:
