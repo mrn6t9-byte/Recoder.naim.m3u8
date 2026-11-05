@@ -50,10 +50,6 @@ UA = E("UA") or "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KH
 REFERER = E("REFERER") or ""
 QUALITY = (E("QUALITY") or "best").lower()       # best / mid / low  (only used when the link is a master playlist)
 WORKERS = min(64, max(1, int(E("WORKERS") or 16)))   # parallel segment downloads
-KEY = (E("KEY") or "").strip()                    # content key given by the source: 32 hex characters, or kid:key (first key is used)
-_keys = [x.split(":")[-1].strip() for x in KEY.replace(";", ",").split(",") if x.strip()]
-KEYHEX = _keys[0] if _keys else ""
-KEYOPT = ["-decryption_key", KEYHEX] if re.fullmatch(r"[0-9a-fA-F]{32}", KEYHEX) else []
 HDR = ["-user_agent", UA]
 
 M33 = 0x1FFFFFFFF                               # 33 bit timestamp mask (90 kHz clock)
@@ -88,8 +84,7 @@ def mmss(s):
 
 
 def mask(t):
-    t = (t or "").replace(URL, "<link>") if URL else (t or "")
-    return t.replace(KEYHEX, "<key>") if KEYHEX else t
+    return (t or "").replace(URL, "<link>") if URL else (t or "")
 
 
 def _origin(u):
@@ -793,8 +788,6 @@ def kind_from_url():
     path = u.split("?")[0]
     if "m3u8" in u:
         return "hls"
-    if path.endswith(".mpd") or ".mpd?" in u or "/manifest.mpd" in u:
-        return "dash"
     if path.endswith((".ts", ".mpegts", ".mts", ".m2ts")):
         return "ts"
     return "?"
@@ -807,8 +800,6 @@ def probe_kind():
         names = (r.stdout or "").lower()
     except Exception:
         names = ""
-    if "dash" in names:
-        return "dash"
     return "hls" if ("hls" in names or "applehttp" in names) else "ts"
 
 
@@ -832,7 +823,7 @@ def precheck():
     last = ""
     for label, hdr in header_sets():
         try:
-            r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error"] + hdr + KEYOPT + ["-t", "6", "-i", URL, "-f", "null", "-"],
+            r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error"] + hdr + ["-t", "6", "-i", URL, "-f", "null", "-"],
                                capture_output=True, text=True, timeout=90)
         except Exception as e:
             last = str(e); continue
@@ -842,9 +833,9 @@ def precheck():
             if KIND == "?":
                 KIND = probe_kind()
             forced = (E("STREAM_TYPE") or "auto").lower()
-            if forced in ("hls", "ts", "dash"):
+            if forced in ("hls", "ts"):
                 KIND = forced
-            print("Link opened using: %s | stream type: %s" % (label, {"ts": "MPEG-TS (live)", "dash": "DASH (.mpd)"}.get(KIND, "HLS (.m3u8)")), flush=True)
+            print("Link opened using: %s | stream type: %s" % (label, "MPEG-TS (live)" if KIND == "ts" else "HLS (.m3u8)"), flush=True)
             return True, ""
         last = mask((r.stderr or "").strip())[-400:]
         print("Could not open with %s: %s" % (label, last.splitlines()[-1] if last else "?"), flush=True)
@@ -903,38 +894,7 @@ def chain(rem_minutes):
            "-f", "quality=" + QUALITY, "-f", "workers=%d" % WORKERS, "-f", "idle_min=%g" % IDLE_STOP]
     if REFERER:
         cmd += ["-f", "referer=" + REFERER]
-    if KEY:
-        cmd += ["-f", "key=" + KEY]
     subprocess.run(cmd)
-
-
-def dash_maps():
-    """DASH has many video/audio versions as separate streams. Pick ONE video (by QUALITY) and the best audio,
-    otherwise ffmpeg would download every version at the same time."""
-    try:
-        r = subprocess.run(["ffprobe", "-v", "error"] + HDR + KEYOPT + ["-show_entries", "stream=index,codec_type,codec_name,width,height,bit_rate",
-                           "-of", "json", URL], capture_output=True, text=True, timeout=90)
-        st = json.loads(r.stdout or "{}").get("streams") or []
-    except Exception:
-        st = []
-
-    def num(x, k):
-        try: return int(x.get(k) or 0)
-        except Exception: return 0
-    vs = sorted([x for x in st if x.get("codec_type") == "video"], key=lambda x: (num(x, "height"), num(x, "bit_rate")))
-    au = sorted([x for x in st if x.get("codec_type") == "audio"], key=lambda x: num(x, "bit_rate"))
-    if not vs and not au:
-        return ["-map", "0:v:0?", "-map", "0:a:0?"]
-    m = []
-    if vs:
-        pick = vs[0] if QUALITY == "low" else vs[len(vs) // 2] if QUALITY == "mid" else vs[-1]
-        print("DASH video: %sx%s %s %d kbps (of %d versions)" % (pick.get("width"), pick.get("height"), pick.get("codec_name"), num(pick, "bit_rate") // 1000, len(vs)), flush=True)
-        if pick.get("codec_name") in ("vp9", "av1", "vp8"):
-            print("WARNING: %s video cannot be put in MPEG-TS. Choose another version or use a different link." % pick.get("codec_name"), flush=True)
-        m += ["-map", "0:%d" % pick["index"]]
-    if au:
-        m += ["-map", "0:%d" % au[-1]["index"]]
-    return m
 
 
 def why_exit(rc, lines):
@@ -956,11 +916,6 @@ def stderr_reader(p, box):
 def record():
     global SP
     os.makedirs(OUT, exist_ok=True)
-    if KEYHEX:
-        print("::add-mask::" + KEYHEX, flush=True)         # never show the key in the log
-        print("Decryption key: %s" % ("set (used for DASH)" if KEYOPT else "NOT valid: it must be 32 hex characters"), flush=True)
-        if len(_keys) > 1:
-            print("More than one key given: only the first one is used.", flush=True)
     detect_chat()
     if URL.strip().lower() in ("", "ask", "telegram"):
         if not (TOKEN and CHAT) and not DRY:
@@ -976,12 +931,7 @@ def record():
         say("❌ <b>The link could not be opened from GitHub's server</b>\n<b>Reason:</b> %s\n\n<code>%s</code>" % (esc(why), esc(err[-300:])))
         sys.exit(1)
     plan = ("stops after %d min" % MINUTES) if MINUTES else "runs until you press Stop"
-    if KIND == "ts":
-        kind_txt = "📡 <b>MPEG-TS live stream</b> (starts now, no rewind)"
-    elif KIND == "dash":
-        kind_txt = "📡 DASH stream (.mpd)  ·  quality %s" % QUALITY
-    else:
-        kind_txt = "📡 HLS stream  ·  %d parallel downloads  ·  quality %s" % (WORKERS, QUALITY)
+    kind_txt = "📡 <b>MPEG-TS live stream</b> (starts now, no rewind)" if KIND == "ts" else "📡 HLS stream  ·  %d parallel downloads  ·  quality %s" % (WORKERS, QUALITY)
     every = "every %s%s" % (human(PART_MAX), (" or %g min" % PART_MIN) if PART_MIN > 0 else "")
     say("🔴 <b>Recording started</b>\n🎬 %s\n%s\n⏱ %s\n✂️ New file %s (whichever comes first)\n📍 GitHub server: %s\nThe first download link comes after the first file is full." %
         (esc(NAME), kind_txt, plan, every, esc(where())), buttons=True)
@@ -1042,7 +992,6 @@ def record():
     threading.Thread(target=stream_monitor, daemon=True).start()
 
     last_err = []; first = True; consec = 0
-    maps = dash_maps() if KIND == "dash" else ["-map", "0:v?", "-map", "0:a?"]
     ran = False
     if KIND == "hls":
         try:
@@ -1057,15 +1006,12 @@ def record():
             # joins the timeline, so a restarted server clock does not matter
             inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "20000000",
                       "-probesize", "2000000", "-analyzeduration", "1500000"]
-        elif KIND == "dash":
-            inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1",
-                      "-reconnect_delay_max", "15"] + KEYOPT
         else:
             inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1",
                       "-reconnect_delay_max", "15", "-seg_max_retry", "30", "-max_reload", "1000", "-m3u8_hold_counters", "1000",
                       "-http_persistent", "1", "-live_start_index", ("-" + BACK) if first else ("-" + RECON_BACK)]
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"] + inopts + HDR + [
-               "-i", URL] + maps + ["-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
+               "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
                "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
         first = False
         t_run = time.time()
