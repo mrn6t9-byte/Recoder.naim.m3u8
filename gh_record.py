@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """Runs inside GitHub Actions.
-Records an HLS / MPEG-TS link in ONE continuous stream (no quality loss), cuts it into files at
+Records an HLS / MPEG-TS link with ffmpeg -c copy (no quality loss) in ONE continuous stream, cuts it into files at
 keyframes every PART_MB megabytes (default 4000 = 4 GB, whatever time that takes) and uploads each finished
 file to Gofile while the recording keeps going. Telegram gets the links, the Status / Split / Stop buttons.
 
-HLS links are downloaded by a PARALLEL segment downloader: WORKERS segments at the same time (default 16),
-every worker keeps its own persistent (keep-alive) connection, so there is no new TCP/TLS handshake per segment.
-If the playlist is encrypted / fMP4 / has a separate audio playlist, ffmpeg is used instead.
-
-Reconnect behaviour (ffmpeg mode):
+Reconnect behaviour:
   * a reader thread + big memory queue keep ffmpeg's pipe empty, so a slow disk/upload never makes the server drop us
   * when ffmpeg has to reconnect, HLS restarts RECON_BACK segments behind live (old data is skipped, nothing is lost)
   * if the server restarts its clock on reconnect, the timestamps are shifted so the video continues smoothly in the
@@ -16,8 +12,7 @@ Reconnect behaviour (ffmpeg mode):
 
   python gh_record.py            record
   python gh_record.py finish     upload anything left over (used by the always() step)"""
-import os, re, sys, json, glob, time, html, queue, signal, shutil, threading, subprocess, http.client, urllib.request, urllib.parse, urllib.error
-from concurrent.futures import ThreadPoolExecutor
+import os, re, sys, json, glob, time, html, queue, signal, shutil, socket, threading, subprocess, urllib.request, urllib.parse, urllib.error
 try:
     import fcntl
 except ImportError:
@@ -32,7 +27,12 @@ MINUTES = float(E("MINUTES") or 0)             # 0 = until Stop
 PART_MIN = float(E("PART_MIN") or 0)            # optional: also split every N minutes (0 = off, split by size only)
 PART_MAX = min(float(E("PART_MB") or 4000), 5000) * 1e6   # a new file every N MB (4000 = 4 GB)
 BACK = E("BACK_SEGS") or "5"                    # start N segments behind live (safety)
-RECON_BACK = E("RECON_BACK") or "12"            # after a reconnect (HLS, ffmpeg mode): start N segments behind
+PROXY = (E("PROXY") or "").strip()              # optional: http://user:pass@host:port - the stream is fetched through this proxy (e.g. a Bangladesh IP)
+MODE = (E("MODE") or "auto").strip().lower()     # auto (finds out itself), live, or archive (a finished file: timeshift / catch-up .ts or .m3u8)
+TEST_KILL_MB = float(E("TEST_KILL_MB") or 0)      # test only: cut the first HLS download after N MB to test resuming
+ARCHIVE = False
+TS_RAW = E("TS_RAW") != "0"                     # direct .ts links: download the bytes ourselves (no ffmpeg start/probe delay on reconnect)
+RECON_BACK = E("RECON_BACK") or "12"            # after a reconnect (HLS): start N segments behind, repeated data is skipped
 OUT = E("OUT_DIR") or "rec"
 MP4_DIR = E("MP4_DIR") or OUT                    # finished .mp4 files (a different disk folder from the .ts files)
 FAILED = E("FAILED_DIR") or "rec_failed"
@@ -43,13 +43,11 @@ IDLE_STOP = float(E("IDLE_STOP_MIN") or 10)     # stop the job when the stream s
 ASKED = False                                   # True when the link came from Telegram (it is kept out of the GitHub page)
 RETRY_BASE = float(E("RETRY_BASE") or 30)       # seconds, grows with every upload retry
 GF = {"folder": "", "token": ""}
-LIMIT = 345 * 60                                # one job runs ~6 h; a new run continues before that
+LIMIT = float(E("LIMIT_MIN") or 345) * 60         # one GitHub job runs ~6 h (345 min); on your own phone/PC set LIMIT_MIN=1440 or more
 STAMP = time.strftime("%Y%m%d_%H%M%S")
 RUN_URL = "https://github.com/%s/actions/runs/%s" % (REPO, RUN)
 UA = E("UA") or "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 REFERER = E("REFERER") or ""
-QUALITY = (E("QUALITY") or "best").lower()       # best / mid / low  (only used when the link is a master playlist)
-WORKERS = min(64, max(1, int(E("WORKERS") or 16)))   # parallel segment downloads
 HDR = ["-user_agent", UA]
 
 M33 = 0x1FFFFFFFF                               # 33 bit timestamp mask (90 kHz clock)
@@ -58,8 +56,8 @@ JUMP_FWD = 270000                               # clock jumped forward more than
 DUP_WINDOW = 90000 * 600                        # data up to 10 min older than what we saved counts as "already have it"
 
 stop = threading.Event()
-S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "page": "", "last_data": time.time(), "reason": "", "qmax": 0,
-     "seg_ok": 0, "seg_fail": 0, "missed": 0}
+D = {"got": 0, "total": None, "secs": 0.0, "dur": None}   # archive download progress
+S = {"proc": None, "t0": time.time(), "restarts": 0, "done": [], "page": "", "last_data": time.time(), "reason": "", "qmax": 0}
 upq = queue.Queue()
 SP = None
 
@@ -84,7 +82,23 @@ def mmss(s):
 
 
 def mask(t):
-    return (t or "").replace(URL, "<link>") if URL else (t or "")
+    t = (t or "").replace(URL, "<link>") if URL else (t or "")
+    return t.replace(PROXY, "<proxy>") if PROXY else t
+
+
+def fenv():
+    """Environment for ffmpeg/ffprobe: only they get the proxy (Telegram and Gofile never go through it)."""
+    e = dict(os.environ)
+    for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "no_proxy", "NO_PROXY"):
+        e.pop(k, None)
+    if PROXY:
+        e["http_proxy"] = PROXY; e["https_proxy"] = PROXY
+    return e
+
+
+def stream_opener():
+    """urllib opener for the stream: through PROXY if set, otherwise direct."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({"http": PROXY, "https": PROXY} if PROXY else {}))
 
 
 def _origin(u):
@@ -116,7 +130,7 @@ def tg(method, **data):
 
 def say(text, buttons=False):
     if not (CHAT or DRY):
-        print("[msg]", re.sub(r"<[^>]+>", "", text))
+        print("[msg]", re.sub(r"<[^>]+>", "", re.sub(r'<a href="([^"]+)">([^<]*)</a>', r"\2 \1", text)))
         return
     d = dict(chat_id=CHAT, text=text, parse_mode="HTML", disable_web_page_preview="true")
     if buttons:
@@ -220,9 +234,9 @@ class Splitter:
         self.hist = []
         self.aud = set(); self.cc = {}; self.last_wr = {}
         self.off = 0; self.last_out_v = None; self.fdur = 3600; self.rebased = 0     # timestamp shift so reconnects join smoothly
-        self.lost = 0.0                                                              # seconds of video the source never delivered
         self.skip = None; self.dropping = set(); self.drop_bytes = 0; self.deduped = 0; self.last_write = time.time(); self.last_es = time.time()
         self.need_key = False; self.need_key_until = 0
+        self.first_pts = None
         self.recent = {}; self.verify = False                # dts -> fingerprint of recently saved pictures
 
     def new_session(self, dedupe=True, verify=False):
@@ -250,6 +264,11 @@ class Splitter:
         self.f.write(b)
         self.last_write = time.time()
 
+    def media_total(self):
+        if self.first_pts is None or self.last_pts is None:
+            return 0.0
+        return ((self.last_pts - self.first_pts) % (1 << 33)) / 90000.0
+
     def media_secs(self):
         if self.start_pts is None or self.last_pts is None:
             return 0.0
@@ -266,7 +285,7 @@ class Splitter:
     def _open(self):
         self.part_no += 1
         self.path = os.path.join(OUT, "%s_%s_part%03d.ts" % (NAME, STAMP, self.part_no))
-        self.f = open(self.path, "wb", buffering=1 << 20)
+        self.f = open(self.path, "wb")
         self.cur_bytes = 0
         self.start_pts = self.last_pts
         for p in (self.pat, self.pmt):                 # every file starts with PAT + PMT, then a keyframe
@@ -321,16 +340,19 @@ class Splitter:
 
     def feed(self, data):
         self.buf += data
-        n = len(self.buf); i = 0
-        while i < n and self.buf[i] != 0x47:
+        buf = self.buf; n = len(buf); i = 0
+        while i < n:                                      # find a start where the sync bytes line up (raw streams can begin mid-packet)
+            if buf[i] == 0x47 and all(buf[i + 188 * j] == 0x47 for j in (1, 2) if i + 188 * j < n):
+                break
             i += 1
         end = i + ((n - i) // 188) * 188
-        buf = self.buf
         for o in range(i, end, 188):
             pk = buf[o:o + 188]
+            if pk[0] != 0x47:                             # lost sync: look for it again in the next data
+                end = o + 1; break
             pid = ((pk[1] & 0x1f) << 8) | pk[2]
-            if pid == 0x1fff:
-                continue                                  # drop empty padding packets
+            if pid == 0x1fff or (pk[1] & 0x80):
+                continue                                  # drop empty padding packets and damaged packets
             pusi = pk[1] & 0x40
             key = False
             is_es = pid == self.vid or pid in self.aud
@@ -387,17 +409,17 @@ class Splitter:
                     if lastv is not None and self.skip is None:
                         dd = sdiff(dts, lastv)
                         if dd < -JUMP_BACK or dd > JUMP_FWD:
-                            # the server clock jumped (reconnect / restart / missing segment): shift all following
-                            # timestamps so the picture continues one frame after the last one. Same file, no cut.
+                            # the server clock jumped (reconnect / restart): shift all following timestamps so the
+                            # picture continues one frame after the last one. Same file, no cut, no freeze.
                             if self.last_out_v is not None:
                                 self.off = (self.last_out_v + self.fdur - dts) & M33
                                 self.rebased += 1
-                                if dd > 0:
-                                    self.lost += dd / 90000.0
-                                print("Clock jump %+.1fs: timeline joined smoothly (join #%d, missing so far %s)" % (dd / 90000.0, self.rebased, mmss(self.lost)), flush=True)
+                                print("Clock jump %+.1fs: timeline joined smoothly (join #%d)" % (dd / 90000.0, self.rebased), flush=True)
                         elif 0 < dd <= 18000:
                             self.fdur = dd                # normal picture spacing, used to place the first picture after a join
                     self.last_pts = (pts + self.off) & M33
+                    if self.first_pts is None:
+                        self.first_pts = self.last_pts
                     self.last_out_v = (dts + self.off) & M33
                     self.last_wr["v"] = dts               # raw value, used to skip repeated data after a reconnect
                     self.recent[dts] = vsig(pk)
@@ -446,16 +468,17 @@ def status_text():
         if t_left < 1e11:
             nxt = "\n✂️ <b>Next auto-split</b>  in ~%s  (at %s)" % (mmss(t_left), human(PART_MAX))
     lines = [
-        "🔴 <b>Recording</b>  ·  %s" % esc(NAME), "",
+        ("⬇️ <b>Downloading archive</b>  ·  %s" if ARCHIVE else "🔴 <b>Recording</b>  ·  %s") % esc(NAME), "",
         "⏱ <b>Elapsed</b>  %s%s" % (hms(el), ("   ·   left %s" % hms(left)) if left is not None else ""),
         "📦 <b>Current file</b>  #%02d  ·  %s  ·  %s" % (sp.part_no if sp else 0, human(sp.cur_bytes) if sp else "0 MB", mmss(sp.media_secs()) if sp else "0:00"),
         "✅ <b>Saved</b>  %d file(s)  ·  %s" % (len(S["done"]), human(saved)),
         "⚡ <b>Speed</b>  %.1f Mbps" % spd + nxt,
     ]
-    if S["seg_ok"] or S["seg_fail"] or S["missed"]:
-        lines.append("📥 <b>Segments</b>  %d ok  ·  %d missed  ·  %d failed" % (S["seg_ok"], S["missed"], S["seg_fail"]))
-    if sp and sp.lost > 0:
-        lines.append("🕳 <b>Missing data</b>  %s  (the source did not deliver it)" % mmss(sp.lost))
+    if ARCHIVE:
+        if KIND == "ts" and D["total"]:
+            lines.append("📥 <b>Downloaded</b>  %s of %s  (%d%%)" % (human(D["got"]), human(D["total"]), 100 * D["got"] // max(1, D["total"])))
+        elif KIND != "ts" and D["dur"]:
+            lines.append("📥 <b>Downloaded</b>  %s of %s  (%d%%)" % (mmss(D["secs"]), mmss(D["dur"]), min(100, int(100 * D["secs"] / max(1, D["dur"])))))
     if S["restarts"]:
         lines.append("♻️ <b>Reconnects</b>  %d  (files are NOT cut by reconnects)" % S["restarts"])
         if S["reason"]:
@@ -490,6 +513,10 @@ def halt():
     p = S["proc"]
     if p and p.poll() is None:
         p.send_signal(signal.SIGINT)                  # ffmpeg finishes cleanly
+    r = S.get("resp")
+    if r is not None:                                 # raw .ts download: cut the connection so the read stops now
+        try: r.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+        except Exception: pass
 
 
 def poll():
@@ -610,156 +637,6 @@ def uploader():
             say("⚠️ Error while saving a file: <code>%s</code>" % esc(repr(e)[:200]))
 
 
-# ---------------- parallel HLS downloader (keep-alive connections) ----------------
-_tl = threading.local()                             # every worker thread keeps its own open connections
-
-
-def _hdrs():
-    h = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "keep-alive"}
-    ref = REFERER or (_origin(URL) + "/")
-    if ref and ref != "/":
-        h["Referer"] = ref
-        h["Origin"] = _origin(ref)
-    return h
-
-
-def _get(url, tries=8, timeout=30):
-    """Download one URL over a persistent connection. None = not available (404/410) or too many errors."""
-    cache = getattr(_tl, "c", None)
-    if cache is None:
-        cache = _tl.c = {}
-    hdr = _hdrs()
-    for i in range(tries):
-        if stop.is_set():
-            return None
-        key = None
-        try:
-            u = url
-            for _ in range(5):                                       # follow redirects
-                p = urllib.parse.urlsplit(u)
-                key = (p.scheme, p.netloc)
-                c = cache.get(key)
-                if c is None:
-                    cls = http.client.HTTPSConnection if p.scheme == "https" else http.client.HTTPConnection
-                    c = cache[key] = cls(p.netloc, timeout=timeout)
-                path = (p.path or "/") + (("?" + p.query) if p.query else "")
-                c.request("GET", path, headers=hdr)
-                r = c.getresponse()
-                body = r.read()
-                if r.status in (301, 302, 303, 307, 308) and r.getheader("Location"):
-                    u = urllib.parse.urljoin(u, r.getheader("Location"))
-                    continue
-                if r.status == 200:
-                    return body
-                if r.status in (404, 410):
-                    return None
-                raise IOError("HTTP %d" % r.status)
-        except Exception:
-            if key is not None:
-                c = cache.pop(key, None)
-                try:
-                    if c:
-                        c.close()
-                except Exception:
-                    pass
-        time.sleep(0.3 * i)                                          # first retry is immediate (an idle connection may just have been closed)
-    return None
-
-
-def _parse_pl(txt, base):
-    seq, dur, segs, variants, enc, fmp4, sepa, bw, pend = 0, 4.0, [], [], False, False, False, 0, False
-    for l in txt.splitlines():
-        l = l.strip()
-        if l.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-            seq = int(l.split(":")[1])
-        elif l.startswith("#EXT-X-TARGETDURATION:"):
-            dur = float(l.split(":")[1])
-        elif l.startswith("#EXT-X-STREAM-INF"):
-            m = re.search(r"BANDWIDTH=(\d+)", l); bw = int(m.group(1)) if m else 0; pend = True
-        elif l.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in l and "URI=" in l:
-            sepa = True                                              # audio is in its own playlist: ffmpeg must join it
-        elif l.startswith("#EXT-X-KEY") and "METHOD=NONE" not in l:
-            enc = True
-        elif l.startswith("#EXT-X-MAP"):
-            fmp4 = True
-        elif l and not l.startswith("#"):
-            u = urllib.parse.urljoin(base, l)
-            if pend:
-                variants.append((bw, u)); pend = False
-            else:
-                segs.append(u)
-    return seq, segs, dur, variants, enc, fmp4, sepa
-
-
-def hls_fetch(rq, workers=WORKERS):
-    """True = it ran (recording done). False = playlist not supported, use ffmpeg instead."""
-    pl = URL
-    segs, seq, dur, enc, fmp4 = [], 0, 4.0, False, False
-    for _ in range(3):
-        raw = _get(pl, tries=4)
-        if not raw:
-            return False
-        seq, segs, dur, variants, enc, fmp4, sepa = _parse_pl(raw.decode("utf-8", "ignore"), pl)
-        if variants:
-            if sepa:
-                print("Separate audio playlist found. Using ffmpeg.", flush=True)
-                return False
-            vs = sorted(variants)
-            pick = vs[0] if QUALITY == "low" else vs[len(vs) // 2] if QUALITY == "mid" else vs[-1]
-            print("Quality %s: %d kbps (of %s)" % (QUALITY, pick[0] // 1000, [v[0] // 1000 for v in vs]), flush=True)
-            pl = pick[1]
-            continue
-        break
-    if enc or fmp4 or not segs:
-        print("Parallel downloader not used (encrypted / fMP4 / empty). Using ffmpeg.", flush=True)
-        return False
-    print("Parallel downloader ON: %d workers, keep-alive | segment %.0fs | %s" % (workers, dur, mask(pl)[:80]), flush=True)
-    ex = ThreadPoolExecutor(workers)
-    pend, nxt, last_ref, ended, first_ok = {}, None, 0, False, False
-    window = max(60, workers * 4)
-    while not stop.is_set():
-        if not ended and time.time() - last_ref >= max(0.7, dur / 3):
-            last_ref = time.time()
-            raw = _get(pl, tries=2, timeout=10)
-            if raw:
-                txt = raw.decode("utf-8", "ignore")
-                seq, segs, dur, _, _, _, _ = _parse_pl(txt, pl)
-                ended = "#EXT-X-ENDLIST" in txt
-                if nxt is None:
-                    nxt = max(seq, seq + len(segs) - int(BACK))
-                elif nxt < seq:
-                    S["missed"] += seq - nxt
-                    print("MISSED %d segment(s): playlist moved on (total missed %d)" % (seq - nxt, S["missed"]), flush=True)
-                    nxt = seq
-                while nxt < seq + len(segs) and len(pend) < window:
-                    pend[nxt] = ex.submit(_get, segs[nxt - seq]); nxt += 1
-        while pend:
-            k = min(pend)
-            f = pend[k]
-            if not f.done():
-                break                                     # segments are written strictly in order
-            del pend[k]
-            d = f.result()
-            if d:
-                if not first_ok:
-                    if len(d) >= 376 and d[0] == 0x47 and d[188] == 0x47:
-                        first_ok = True
-                    else:
-                        print("Segments are not MPEG-TS. Using ffmpeg.", flush=True)
-                        ex.shutdown(wait=False, cancel_futures=True)
-                        return False
-                S["seg_ok"] += 1
-                rq.put(("d", d)); S["last_data"] = time.time()
-            else:
-                S["seg_fail"] += 1
-                print("Segment %d failed after retries (total failed %d)" % (k, S["seg_fail"]), flush=True)
-        if ended and not pend:
-            break
-        time.sleep(0.1)
-    ex.shutdown(wait=False, cancel_futures=True)
-    return True
-
-
 # ---------------- link check + recording ----------------
 def explain(err):
     e = (err or "").lower()
@@ -796,7 +673,7 @@ def kind_from_url():
 def probe_kind():
     try:
         r = subprocess.run(["ffprobe", "-v", "error", "-rw_timeout", "20000000"] + HDR + ["-show_entries", "format=format_name", "-of", "csv=p=0", URL],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, timeout=60, env=fenv())
         names = (r.stdout or "").lower()
     except Exception:
         names = ""
@@ -819,16 +696,17 @@ def header_sets():
 
 
 def precheck():
-    global HDR, KIND
+    global HDR
     last = ""
     for label, hdr in header_sets():
         try:
             r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error"] + hdr + ["-t", "6", "-i", URL, "-f", "null", "-"],
-                               capture_output=True, text=True, timeout=90)
+                               capture_output=True, text=True, timeout=90, env=fenv())
         except Exception as e:
             last = str(e); continue
         if r.returncode == 0:
             HDR = hdr
+            global KIND
             KIND = kind_from_url()
             if KIND == "?":
                 KIND = probe_kind()
@@ -875,11 +753,12 @@ def ask_link():
 
 
 def where():
+    """Place of the IP the stream server sees (the proxy's, if a proxy is set)."""
     try:
-        d = json.load(urllib.request.urlopen("https://ipinfo.io/json", timeout=8))
-        return "%s, %s" % (d.get("city", "?"), d.get("country", "?"))
+        d = json.load(stream_opener().open("https://ipinfo.io/json", timeout=10))
+        return "%s, %s%s" % (d.get("city", "?"), d.get("country", "?"), " (via proxy)" if PROXY else "")
     except Exception:
-        return "unknown"
+        return "unknown" + (" (via proxy)" if PROXY else "")
 
 
 def chain(rem_minutes):
@@ -890,8 +769,7 @@ def chain(rem_minutes):
     if ASKED:
         say("🔁 A new run starts now. <b>Send the stream link again</b> when it asks, so the link is never shown on GitHub.")
     cmd = ["gh", "workflow", "run", "record.yml", "--repo", REPO, "-f", "url=" + ("ask" if ASKED else URL), "-f", "minutes=%d" % rem_minutes,
-           "-f", "name=" + NAME, "-f", "part_min=%s" % PART_MIN, "-f", "part_mb=%d" % (PART_MAX / 1e6),
-           "-f", "quality=" + QUALITY, "-f", "workers=%d" % WORKERS, "-f", "idle_min=%g" % IDLE_STOP]
+           "-f", "name=" + NAME, "-f", "part_min=%s" % PART_MIN, "-f", "part_mb=%d" % (PART_MAX / 1e6)]
     if REFERER:
         cmd += ["-f", "referer=" + REFERER]
     subprocess.run(cmd)
@@ -907,16 +785,194 @@ def why_exit(rc, lines):
 
 def stderr_reader(p, box):
     for line in iter(p.stderr.readline, b""):
-        s = line.decode("utf-8", "ignore")
-        box.append(s)
+        box.append(line.decode("utf-8", "ignore"))
         del box[:-30]
-        print("[ffmpeg]", mask(s.strip())[:200], flush=True)
+
+
+def hdr_dict():
+    """The ffmpeg header options (HDR) as a normal dict for our own downloader."""
+    h = {"User-Agent": UA, "Accept": "*/*"}
+    a, i = HDR, 0
+    while i + 1 < len(a):
+        k, v = a[i], a[i + 1]
+        if k == "-user_agent":
+            h["User-Agent"] = v
+        elif k == "-referer":
+            h["Referer"] = v
+        elif k == "-headers":
+            for line in v.split("\r\n"):
+                if ":" in line:
+                    n, _, val = line.partition(":"); h[n.strip()] = val.strip()
+        i += 2
+    return h
+
+
+def ts_pull(rq):
+    """One connection to a direct MPEG-TS link. Bytes go straight into the queue. Returns (why it ended, bytes got)."""
+    got = 0
+    try:
+        r = stream_opener().open(urllib.request.Request(URL, headers=hdr_dict()), timeout=20)
+    except urllib.error.HTTPError as e:
+        return "HTTP %s from the server" % e.code, 0
+    except Exception as e:
+        return mask(repr(e))[:150], 0
+    S["resp"] = r
+    try:
+        while not stop.is_set():
+            data = r.read1(1 << 16)
+            if not data:
+                return "server closed the connection", got
+            got += len(data)
+            rq.put(("d", data)); S["last_data"] = time.time()
+            S["qmax"] = max(S["qmax"], rq.qsize())
+        return "stopped", got
+    except Exception as e:
+        return mask(repr(e))[:150], got
+    finally:
+        S["resp"] = None
+        try: r.close()
+        except Exception: pass
+
+
+def detect_archive():
+    """True if the link is a finished file (timeshift / catch-up), False if it is a live stream."""
+    if MODE == "live":
+        return False
+    if MODE == "archive":
+        return True
+    try:
+        r = stream_opener().open(urllib.request.Request(URL, headers=hdr_dict()), timeout=20)
+        try:
+            if KIND == "ts":
+                cl = r.headers.get("Content-Length")           # a live stream has no length, a file has
+                return bool(cl and cl.isdigit() and int(cl) > 500_000)
+            return "#EXT-X-ENDLIST" in r.read(400000).decode("utf-8", "ignore")   # a finished playlist ends with this tag
+        finally:
+            r.close()
+    except Exception:
+        return False
+
+
+def dl_ts_once(rq):
+    """One connection of a .ts file download. Always continues exactly where the last one stopped."""
+    start = D["got"]
+    h = hdr_dict()
+    if start:
+        h["Range"] = "bytes=%d-" % start
+    try:
+        r = stream_opener().open(urllib.request.Request(URL, headers=h), timeout=30)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and D["total"] and start >= D["total"]:
+            return True, "complete"
+        return False, "HTTP %s from the server" % e.code
+    except Exception as e:
+        return False, mask(repr(e))[:150]
+    S["resp"] = r
+    skip = 0
+    try:
+        cr = r.headers.get("Content-Range") or ""
+        cl = r.headers.get("Content-Length")
+        if r.status == 206 and cr.rsplit("/", 1)[-1].isdigit():
+            D["total"] = int(cr.rsplit("/", 1)[-1])
+        elif r.status == 200:
+            if cl and cl.isdigit():
+                D["total"] = int(cl)
+            skip = start                                      # the server ignored Range: skip what we already have
+        while not stop.is_set():
+            data = r.read1(1 << 16)
+            if not data:
+                break
+            if skip:
+                if len(data) <= skip:
+                    skip -= len(data); continue
+                data = data[skip:]; skip = 0
+            rq.put(("d", data)); D["got"] += len(data); S["last_data"] = time.time()
+        else:
+            return False, "stopped"
+        if D["total"] and D["got"] < D["total"]:
+            return False, "connection closed at %s of %s" % (human(D["got"]), human(D["total"]))
+        return True, "complete"
+    except Exception as e:
+        return False, mask(repr(e))[:150]
+    finally:
+        S["resp"] = None
+        try: r.close()
+        except Exception: pass
+
+
+def wait_drain(rq):
+    t = time.time()
+    while not rq.empty() and time.time() - t < 60:
+        time.sleep(0.2)
+    time.sleep(0.6)
+
+
+def dl_hls_once(rq, first):
+    """One ffmpeg run over a finished .m3u8. After a failure it starts a few seconds before where it stopped."""
+    before = D["secs"]
+    ss = ["-ss", "%.1f" % (D["secs"] - 10)] if D["secs"] > 15 else []
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000",
+           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-http_persistent", "0"] + ss + HDR + [
+           "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
+           "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
+    if not first:
+        rq.put(("n", True, False))                           # the few repeated seconds are dropped (same clock)
+    p = S["proc"] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, env=fenv())
+    err = []
+    threading.Thread(target=stderr_reader, args=(p, err), daemon=True).start()
+    got = 0
+    while True:
+        data = p.stdout.read(1 << 16)
+        if not data:
+            break
+        rq.put(("d", data)); got += len(data); S["last_data"] = time.time()
+        if TEST_KILL_MB and first and got > TEST_KILL_MB * 1e6 and p.poll() is None:
+            p.kill()
+    p.wait()
+    wait_drain(rq)
+    D["secs"] = max(D["secs"], SP.media_total())
+    if stop.is_set():
+        return False, "stopped"
+    if p.returncode == 0 and (D["dur"] is None or D["secs"] >= D["dur"] - 8 or D["secs"] - before < 2):
+        return True, "complete"
+    return False, why_exit(p.returncode, err)
+
+
+def download_loop(rq):
+    """Finished file (timeshift / catch-up): download everything, resume after every break. Returns True if complete."""
+    if KIND != "ts":
+        try:
+            r = subprocess.run(["ffprobe", "-v", "error"] + HDR + ["-show_entries", "format=duration", "-of", "csv=p=0", URL],
+                               capture_output=True, text=True, timeout=90, env=fenv())
+            D["dur"] = float((r.stdout or "").strip().split()[0])
+        except Exception:
+            D["dur"] = None
+    fails = n = 0
+    while not stop.is_set():
+        before = D["got"] if KIND == "ts" else D["secs"]
+        done, why = dl_ts_once(rq) if KIND == "ts" else dl_hls_once(rq, n == 0)
+        n += 1
+        if done:
+            return True
+        if stop.is_set():
+            return False
+        gain = (D["got"] if KIND == "ts" else D["secs"]) - before
+        fails = 0 if gain > (1_000_000 if KIND == "ts" else 2) else fails + 1
+        S["restarts"] += 1; S["reason"] = why
+        print("Download interrupted (%s). Continuing where it stopped (try %d)" % (why, n), flush=True)
+        if fails >= 8:
+            say("❌ <b>The download stopped</b> and could not continue after several tries.\n<code>%s</code>" % esc(why[:200]))
+            return False
+        time.sleep(min(2 * fails + 1, 20))
+    return False
 
 
 def record():
-    global SP
+    global SP, HDR, ARCHIVE
     os.makedirs(OUT, exist_ok=True)
     detect_chat()
+    if PROXY:
+        print("::add-mask::" + PROXY, flush=True)
     if URL.strip().lower() in ("", "ask", "telegram"):
         if not (TOKEN and CHAT) and not DRY:
             print("::error title=No Telegram chat::Send 'hi' to your bot first, then run again.", flush=True)
@@ -930,15 +986,21 @@ def record():
         summary("## Recording did not start\n**Reason:** " + why + "\n\n```\n" + err + "\n```")
         say("❌ <b>The link could not be opened from GitHub's server</b>\n<b>Reason:</b> %s\n\n<code>%s</code>" % (esc(why), esc(err[-300:])))
         sys.exit(1)
+    ARCHIVE = detect_archive()
+    print("Link type: %s" % ("finished file (archive): it is downloaded completely" if ARCHIVE else "live stream"), flush=True)
     plan = ("stops after %d min" % MINUTES) if MINUTES else "runs until you press Stop"
-    kind_txt = "📡 <b>MPEG-TS live stream</b> (starts now, no rewind)" if KIND == "ts" else "📡 HLS stream  ·  %d parallel downloads  ·  quality %s" % (WORKERS, QUALITY)
+    kind_txt = "📡 <b>MPEG-TS live stream</b> (starts now, no rewind)" if KIND == "ts" else "📡 HLS stream"
     every = "every %s%s" % (human(PART_MAX), (" or %g min" % PART_MIN) if PART_MIN > 0 else "")
-    say("🔴 <b>Recording started</b>\n🎬 %s\n%s\n⏱ %s\n✂️ New file %s (whichever comes first)\n📍 GitHub server: %s\nThe first download link comes after the first file is full." %
-        (esc(NAME), kind_txt, plan, every, esc(where())), buttons=True)
+    if ARCHIVE:
+        say("⬇️ <b>Archive download started</b>\n🎬 %s\n📡 %s\n✂️ New file every %s\n📍 Stream server sees an IP in: %s\nEach file is uploaded when it is full. Use Status to see the progress." %
+            (esc(NAME), "finished .ts file" if KIND == "ts" else "finished .m3u8 playlist", human(PART_MAX), esc(where())), buttons=True)
+    else:
+        say("🔴 <b>Recording started</b>\n🎬 %s\n%s\n⏱ %s\n✂️ New file %s (whichever comes first)\n📍 Stream server sees an IP in: %s\nThe first download link comes after the first file is full." %
+            (esc(NAME), kind_txt, plan, every, esc(where())), buttons=True)
     signal.signal(signal.SIGINT, lambda *a: halt())
     signal.signal(signal.SIGTERM, lambda *a: halt())
     total = MINUTES * 60
-    if not total or total > LIMIT:
+    if (not total or total > LIMIT) and not ARCHIVE:
         threading.Thread(target=chain, args=(int((total - LIMIT) / 60) if total else 0,), daemon=True).start()
     if TOKEN and CHAT and not DRY:
         threading.Thread(target=poll, daemon=True).start()
@@ -948,9 +1010,9 @@ def record():
     SP.on_manual = lambda n: say("✂️ <b>Split done</b>\nFile #%d started. Recording continues." % n, buttons=True)
     end_at = S["t0"] + (min(total, LIMIT) if total else LIMIT)
 
-    # The downloader / ffmpeg reader only moves bytes into this queue. The splitter works on the other side.
-    # So a slow disk, a busy CPU or an upload can never stall the download and make the server drop the connection.
-    rq = queue.Queue(maxsize=1500)
+    # The reader (below) only moves bytes from ffmpeg into this queue. The splitter works on the other side.
+    # So a slow disk, a busy CPU or an upload can never make the pipe full and the server drop the connection.
+    rq = queue.Queue(maxsize=4000)
 
     def consumer():
         while True:
@@ -991,16 +1053,31 @@ def record():
             time.sleep(5)
     threading.Thread(target=stream_monitor, daemon=True).start()
 
-    last_err = []; first = True; consec = 0
-    ran = False
-    if KIND == "hls":
-        try:
-            ran = hls_fetch(rq, WORKERS)                     # parallel downloader; False = not supported, ffmpeg takes over
-        except Exception as e:
-            print("parallel downloader crashed, switching to ffmpeg:", repr(e), flush=True)
-            ran = False
-            rq.put(("n", True, False))
-    while not stop.is_set() and not ran:
+    last_err = []; first = True; consec = 0; hi = [0]
+    dl_ok = True
+    if ARCHIVE:
+        dl_ok = download_loop(rq)
+        stop.set()                                             # nothing more to fetch (also quiets the stream monitor)
+    while not stop.is_set() and not ARCHIVE:
+        if KIND == "ts" and TS_RAW:
+            # Direct download of the MPEG-TS bytes: reconnect takes milliseconds (no ffmpeg start, no probing), so even a
+            # server that drops the link every second costs (almost) nothing. The splitter joins / de-duplicates as before.
+            t_run = time.time()
+            reason, got = ts_pull(rq)
+            first = False
+            if stop.is_set() or TEST_ONCE:
+                break
+            S["restarts"] += 1
+            rq.put(("n", True, True))
+            S["reason"] = reason
+            consec = 0 if got > 0 else consec + 1
+            print("Reconnect %d: lasted %.1fs, got %.1f MB: %s" % (S["restarts"], time.time() - t_run, got / 1e6, reason), flush=True)
+            if got == 0 and consec % 3 == 0:               # the server keeps refusing: try another set of headers (browser / referer / VLC ...)
+                sets = header_sets(); hi[0] = (hi[0] + 1) % len(sets)
+                HDR = sets[hi[0]][1]
+                print("Server keeps refusing: now trying %s" % sets[hi[0]][0], flush=True)
+            time.sleep(0.2 if got > 0 else min(0.5 + 0.5 * consec, 5))
+            continue
         if KIND == "ts":
             # no ffmpeg-internal reconnect: after a drop a NEW ffmpeg starts quickly (small probe), and the splitter
             # joins the timeline, so a restarted server clock does not matter
@@ -1008,14 +1085,14 @@ def record():
                       "-probesize", "2000000", "-analyzeduration", "1500000"]
         else:
             inopts = ["-fflags", "+discardcorrupt+genpts", "-rw_timeout", "60000000", "-reconnect", "1", "-reconnect_streamed", "1",
-                      "-reconnect_delay_max", "15", "-seg_max_retry", "30", "-max_reload", "1000", "-m3u8_hold_counters", "1000",
-                      "-http_persistent", "1", "-live_start_index", ("-" + BACK) if first else ("-" + RECON_BACK)]
+                      "-reconnect_delay_max", "15", "-seg_max_retry", "15", "-max_reload", "1000", "-m3u8_hold_counters", "1000",
+                      "-http_persistent", "0", "-live_start_index", ("-" + BACK) if first else ("-" + RECON_BACK)]
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"] + inopts + HDR + [
                "-i", URL, "-map", "0:v?", "-map", "0:a?", "-c", "copy", "-copyts", "-muxdelay", "0", "-muxpreload", "0",
                "-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
         first = False
         t_run = time.time()
-        p = S["proc"] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        p = S["proc"] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, env=fenv())
         if fcntl:
             try: fcntl.fcntl(p.stdout.fileno(), 1031, 1 << 20)       # F_SETPIPE_SZ: 1 MB pipe
             except Exception: pass
@@ -1043,12 +1120,11 @@ def record():
     up.join()
     saved = sum(d["size"] for d in S["done"])
     page = S["page"]
-    summary("## Recording finished\n%d file(s), %s. %s" % (len(S["done"]), human(saved), ("[Download page](%s)" % page) if page else ""))
+    word = "Download" if ARCHIVE else "Recording"
+    summary("## %s finished\n%d file(s), %s. %s" % (word, len(S["done"]), human(saved), ("[Download page](%s)" % page) if page else ""))
     rows = "\n".join("%d.  %s  ·  %s" % (i + 1, human(d["size"]), mmss(d["secs"])) for i, d in enumerate(S["done"][:30]))
-    lost = ("\n🕳 Missing (source did not deliver): %s" % mmss(SP.lost)) if SP.lost > 0 else ""
-    segs = ("\n📥 Segments: %d ok · %d missed · %d failed" % (S["seg_ok"], S["missed"], S["seg_fail"])) if (S["seg_ok"] or S["missed"] or S["seg_fail"]) else ""
-    say("🏁 <b>Recording finished</b>\n🎬 %s\n📁 %d file(s)  ·  %s\n⏱ %s%s%s\n\n%s%s" %
-        (esc(NAME), len(S["done"]), human(saved), hms(time.time() - S["t0"]), segs, lost, rows,
+    say("%s <b>%s finished</b>%s\n🎬 %s\n📁 %d file(s)  ·  %s\n⏱ %s\n\n%s%s" %
+        ("🏁" if dl_ok else "⚠️", word, "" if dl_ok else " (NOT complete)", esc(NAME), len(S["done"]), human(saved), hms(time.time() - S["t0"]), rows,
          ('\n\n📂 <a href="%s">Download all files (one page)</a>' % page) if page else "\n\n⚠️ No file could be uploaded. See the run log."))
 
 
