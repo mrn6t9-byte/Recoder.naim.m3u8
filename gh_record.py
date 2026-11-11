@@ -1207,8 +1207,12 @@ def preflight():
     print("Bot: @%s" % (me.get("result") or {}).get("username", "?"), flush=True)
     wh = (tg("getWebhookInfo").get("result") or {})
     if wh.get("url"):
-        print("::error title=This bot has a webhook::TG_TOKEN belongs to a bot that already has a webhook (probably the shared bot). Use a bot that has no webhook (the shared bot has one): make a new bot in BotFather and put its token in TG_TOKEN.", flush=True)
-        sys.exit(1)
+        # The personal workflow has no Worker, so a webhook on this bot only blocks reading your link: remove it.
+        print("This bot had a webhook (%s). Removing it so the bot can read your link." % wh["url"].split("/")[2], flush=True)
+        d = tg("deleteWebhook")
+        if not d.get("ok"):
+            print("::error title=This bot has a webhook::Could not remove it. Open https://api.telegram.org/bot<TOKEN>/deleteWebhook once, or use a new bot from BotFather.", flush=True)
+            sys.exit(1)
     if not CHAT:
         detect_chat()
     if not CHAT:
@@ -2152,11 +2156,4 @@ def record():
     rows = "\n".join("%d.  %s  ·  %s" % (i + 1, human(d["size"]), mmss(d["secs"])) for i, d in enumerate(S["done"][:30]))
     say("%s <b>%s finished</b>%s\n🎬 %s\n📁 %d file(s)  ·  %s\n⏱ %s\n\n%s%s" %
         ("🏁" if dl_ok else "⚠️", word, "" if dl_ok else " (NOT complete)", esc(NAME), len(S["done"]), human(saved), hms(time.time() - S["t0"]), rows,
-         ('\n\n📂 <a href="%s">Download all files (one page)</a>' % page) if page else "\n\n⚠️ No file could be uploaded. See the run log."))
-
-
-def finish():
-    """always() step: upload leftovers if the main step was cancelled or killed."""
-    leftovers = sorted(glob.glob(os.path.join(OUT, "*.ts")))
-    if not leftovers:
-        retu
+         ('\n\n📂 <a href="%s">Download all files (one page)</a>' % page) if page else "\n\n⚠️ No file could
