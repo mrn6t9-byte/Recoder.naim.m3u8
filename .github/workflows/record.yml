@@ -1,4 +1,4 @@
-name: Record
+name: Record (personal)
 on:
   workflow_dispatch:
     inputs:
@@ -52,8 +52,10 @@ jobs:
     timeout-minutes: 355
     env:
       PYTHONUNBUFFERED: "1"
-      TG_TOKEN: ${{ secrets.TG_TOKEN }}
-      TG_CHAT: ${{ secrets.TG_CHAT }}
+      TG_TOKEN: ${{ secrets.TG_TOKEN_PERSONAL }}
+      TG_CHAT: ${{ secrets.TG_CHAT_PERSONAL }}
+      WORKFLOW_FILE: record_personal.yml
+      LIVE_CARD: "1"            # the live message is a picture dashboard (ring, speed graph, tiles); "0" = plain text
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
@@ -72,7 +74,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install ffmpeg
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+        timeout-minutes: 10
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          if command -v ffmpeg >/dev/null 2>&1; then echo "ffmpeg already installed"; exit 0; fi
+          sudo timeout 240 apt-get install -y -qq --no-install-recommends ffmpeg || {
+            echo "first try failed, updating the package list and trying again"
+            sudo timeout 120 apt-get update -qq || true
+            sudo timeout 300 apt-get install -y -qq ffmpeg
+          }
+      - name: Picture dashboard tools
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          python3 -c "import PIL" 2>/dev/null || pip install -q --break-system-packages pillow
+          fc-list 2>/dev/null | grep -qi dejavu || sudo apt-get install -y -qq --no-install-recommends fonts-dejavu-core
       - name: Use the second disk for recording
         run: sudo mkdir -p /mnt/rec && sudo chown "$USER" /mnt/rec
       - name: Record
