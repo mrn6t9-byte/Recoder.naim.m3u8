@@ -126,7 +126,7 @@ def tg(method, **data):
         print("[telegram]", method, re.sub(r"<[^>]+>", "", str(data.get("text", ""))).replace("\n", " | "))
         return {}
     try:
-        req = urllib.request.Request("https://api.telegram.org/bot%s/%s" % (TOKEN, method), urllib.parse.urlencode(data).encode())
+        req = urllib.request.Request("%s/bot%s/%s" % (E("TG_API") or "https://api.telegram.org", TOKEN, method), urllib.parse.urlencode(data).encode())
         return json.load(urllib.request.urlopen(req, timeout=40))
     except urllib.error.HTTPError as e:
         try: body = e.read().decode()[:200]
@@ -1152,6 +1152,33 @@ def worker_poll():
             time.sleep(0.5)
 
 
+def preflight():
+    """Personal bot: check the secrets and the bot BEFORE asking for the link, with clear errors."""
+    if DRY:
+        return
+    if not TOKEN:
+        print("::error title=Secret TG_TOKEN is empty::Repo > Settings > Secrets and variables > Actions > New repository secret. Name: TG_TOKEN, value: the token from BotFather.", flush=True)
+        sys.exit(1)
+    me = tg("getMe")
+    if not me.get("ok"):
+        print("::error title=Bot token is wrong::Telegram refused TG_TOKEN (error %s). Copy the token again from BotFather and save it in the secret." % me.get("error_code", "?"), flush=True)
+        sys.exit(1)
+    print("Bot: @%s" % (me.get("result") or {}).get("username", "?"), flush=True)
+    wh = (tg("getWebhookInfo").get("result") or {})
+    if wh.get("url"):
+        print("::error title=This bot has a webhook::TG_TOKEN belongs to a bot that already has a webhook (probably the shared bot). Use a bot that has no webhook (the shared bot has one): make a new bot in BotFather and put its token in TG_TOKEN.", flush=True)
+        sys.exit(1)
+    if not CHAT:
+        detect_chat()
+    if not CHAT:
+        print("::error title=No chat id::Open your personal bot in Telegram, press Start and send 'hi', then run again. (Or add secret TG_CHAT = your chat id.)", flush=True)
+        sys.exit(1)
+    r = tg("sendMessage", chat_id=CHAT, text="⏳ Workflow started. Getting ready...")
+    if r.get("error_code") in (400, 403):
+        print("::error title=The bot cannot write to your chat::Open your personal bot in Telegram, press Start, and check that TG_CHAT is YOUR chat id (a number). Telegram error %s." % r.get("error_code"), flush=True)
+        sys.exit(1)
+
+
 def ask_link():
     """URL = "ask": wait for the m3u8 link in Telegram, so a public repo never shows it."""
     global URL, ASKED
@@ -1898,9 +1925,7 @@ def record():
         print("::error title=No link::The worker did not return the link for this ticket.", flush=True)
         sys.exit(1)
     if URL.strip().lower() in ("", "ask", "telegram"):
-        if not (TOKEN and CHAT) and not DRY:
-            print("::error title=No Telegram chat::Send 'hi' to your bot first, then run again.", flush=True)
-            sys.exit(1)
+        preflight()
         ask_link()
     ok, err = precheck()
     if not ok:
