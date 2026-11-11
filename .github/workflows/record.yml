@@ -52,8 +52,8 @@ jobs:
     timeout-minutes: 355
     env:
       PYTHONUNBUFFERED: "1"
-      TG_TOKEN: ${{ secrets.TG_TOKEN_PERSONAL }}
-      TG_CHAT: ${{ secrets.TG_CHAT_PERSONAL }}
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
       WORKFLOW_FILE: record_personal.yml
       LIVE_CARD: "1"            # the live message is a picture dashboard (ring, speed graph, tiles); "0" = plain text
       GH_TOKEN: ${{ github.token }}
