@@ -651,7 +651,7 @@ def _font(ImageFont, size, bold=False):
     return ImageFont.load_default()
 
 
-def live_card(i, ended=False, hist=()):
+def live_card(i, ended=False, hist=(), note=None):
     """A 1000x560 picture: ring progress, stat tiles and a speed graph. Returns PNG bytes."""
     mods = _pil()
     if not mods:
@@ -691,6 +691,12 @@ def live_card(i, ended=False, hist=()):
     nm = NAME if len(NAME) <= 34 else NAME[:33] + "…"
     T(52, 108, nm, F(26), muted, "lm")
     d.line((52 * K, 138 * K, (W - 52) * K, 138 * K), fill=track, width=2 * K)
+    if note:                                                          # what the person just pressed
+        nt, nc = note
+        fw = F(22, True)
+        tw = d.textlength(nt, font=fw) / K
+        R(W - 52 - tw - 44, 36, W - 52, 80, 22, nc)
+        T(W - 52 - tw / 2 - 22, 58, nt, fw, (12, 14, 30), "mm")
 
     # ring
     frac, sub, center = 0.0, "", "--"
@@ -709,14 +715,15 @@ def live_card(i, ended=False, hist=()):
             got = "%s / %s" % (mmss(D["secs"]), mmss(D["dur"]))
         else:
             got = human(D["got"])
-        tiles = [("TIME", hms(el)), ("SPEED", "%.1f Mbps" % spd), ("DOWNLOADED", got),
+        tiles = [("ELAPSED", hms(el)), ("SPEED", "%.1f Mbps" % spd), ("DOWNLOADED", got),
                  ("TIME LEFT", ("~" + hms(eta)) if (eta and not ended) else "--")]
     else:
         frac = min(1.0, sp.cur_bytes / PART_MAX) if (sp and PART_MAX) else 0.0
         sub = "of file #%02d" % (sp.part_no if sp else 0)
-        tiles = [("TIME", hms(el)), ("SPEED", "%.1f Mbps" % spd),
-                 ("SAVED", "%d file(s) · %s" % (len(S["done"]), human(saved))),
-                 ("VIDEO", mmss(sp.media_secs()) if sp else "0:00")]
+        tot = sum(x.get("secs", 0) for x in S["done"]) + (sp.media_secs() if sp else 0)
+        tiles = [("RECORDED", hms(tot)), ("SPEED", "%.1f Mbps" % spd),
+                 ("THIS FILE", "#%02d · %s" % (sp.part_no if sp else 0, human(sp.cur_bytes) if sp else "0 MB")),
+                 ("SAVED", "%d file(s) · %s" % (len(S["done"]), human(saved)))]
     frac = max(0.0, min(1.0, frac))
     center = "%d%%" % int(frac * 100)
     rcx, rcy, rr, rw = 230, 322, 128, 26
@@ -758,7 +765,14 @@ def live_card(i, ended=False, hist=()):
         T(928, 396, "now %.1f   max %.1f" % (vals[-1], max(vals)), F(15), muted, "rm")
 
     # footer
-    foot = "Reconnects: %d" % S["restarts"] if S["restarts"] else "No reconnects"
+    foot = ("Files saved: %d" % len(S["done"])) if ARCHIVE else "Running %s" % hms(el)
+    foot += ("  ·  Reconnects: %d" % S["restarts"]) if S["restarts"] else "  ·  No reconnects"
+    if not ARCHIVE and sp and sp.f and not ended:
+        t_left = (PART_MIN * 60 - sp.media_secs()) if PART_MIN > 0 else 1e12
+        if spd > 0.1:
+            t_left = min(t_left, (PART_MAX - sp.cur_bytes) * 8 / (spd * 1e6))
+        if t_left < 1e11:
+            foot += "  ·  Next split ~%s" % mmss(t_left)
     T(52, 538, foot, F(16), muted, "lm")
     T(W - 52, 538, "Updated " + clock(), F(16), muted, "rm")
     out = img.resize((W, H), Image.LANCZOS)
@@ -799,6 +813,28 @@ def tg_photo(method, fields, png):
         return {}
 
 
+HIST = []
+
+
+def pic_reply(note, caption):
+    """Status / Split / Stop answer as a picture card (falls back to text when pictures are off)."""
+    if E("LIVE_CARD") != "1" or DRY:
+        return False
+    try:
+        png = live_card(1, stop.is_set(), HIST, note)
+    except Exception as e:
+        print("pic reply:", repr(e)[:120], flush=True)
+        return False
+    if not png:
+        return False
+    kb = json.dumps({"inline_keyboard": []} if stop.is_set() else KB)
+    ok = False
+    for cid in dict.fromkeys([c for c in [CHAT] + ALSO if c]):
+        r = tg_photo("sendPhoto", {"chat_id": cid, "caption": caption, "parse_mode": "HTML", "reply_markup": kb}, png)
+        ok = ok or bool(r.get("ok"))
+    return ok
+
+
 def live_loop():
     cids = list(dict.fromkeys([c for c in [CHAT] + ALSO if c]))
     if not cids:
@@ -812,6 +848,7 @@ def live_loop():
         png = text = None
         try:
             hist = (hist + [SP.speed_mbps() if SP else 0.0])[-16:]
+            HIST[:] = hist
             if use_img:
                 png = live_card(i, ended, hist)
             if not png:
@@ -866,16 +903,20 @@ def do_action(act, cq_id=None):
     global SP
     act = (act or "").split("@")[0]
     if act == "status":
-        txt = "Status sent"; say(status_text(), buttons=True)
+        txt = "Status sent"
+        if not pic_reply(("STATUS", (80, 165, 255)), "📊 <b>Status</b> · %s" % esc(NAME)):
+            say(status_text(), buttons=True)
     elif act == "split":
         if SP and SP.f:
             SP.want_split = True; txt = "Split requested"
-            say("✂️ <b>Split requested</b>\nThe current file is closed at the next keyframe (a few seconds). Recording continues in a new file.", buttons=True)
+            if not pic_reply(("SPLIT REQUESTED", (255, 190, 60)), "✂️ <b>Split requested</b>\nThe file closes at the next keyframe. Recording continues in a new file."):
+                say("✂️ <b>Split requested</b>\nThe current file is closed at the next keyframe (a few seconds). Recording continues in a new file.", buttons=True)
         else:
             txt = "Not recording yet"; say("Recording has not started yet, nothing to split.")
     elif act == "stop":
         txt = "Stopping"
-        say("⏹ <b>Stopping...</b>\nSaving the last file. This can take up to a minute.")
+        if not pic_reply(("STOPPING", (255, 77, 94)), "⏹ <b>Stopping...</b>\nSaving the last file. This can take up to a minute."):
+            say("⏹ <b>Stopping...</b>\nSaving the last file. This can take up to a minute.")
         halt()
     else:
         return
@@ -2118,11 +2159,4 @@ def finish():
     """always() step: upload leftovers if the main step was cancelled or killed."""
     leftovers = sorted(glob.glob(os.path.join(OUT, "*.ts")))
     if not leftovers:
-        return
-    for f in leftovers:
-        process(f)
-    say("⚠️ <b>Recording was interrupted.</b> Saved %d leftover file(s).%s" % (len(leftovers), ('\n📂 <a href="%s">Download page</a>' % S["page"]) if S["page"] else ""))
-
-
-if __name__ == "__main__":
-    finish() if len(sys.argv) > 1 and sys.argv[1] == "finish" else record()
+        retu
