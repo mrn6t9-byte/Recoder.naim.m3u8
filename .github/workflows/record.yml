@@ -1,4 +1,4 @@
-name: Record (personal)
+name: Record
 on:
   workflow_dispatch:
     inputs:
@@ -41,6 +41,18 @@ on:
         description: "Optional: website the link is played on (only if the link needs it)"
         required: false
         default: ""
+      ticket:
+        description: "Leave empty (used only by the shared bot)"
+        required: false
+        default: ""
+      chat:
+        description: "Leave empty (used only by the shared bot)"
+        required: false
+        default: ""
+      also:
+        description: "Leave empty (used only by the shared bot)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -52,10 +64,10 @@ jobs:
     timeout-minutes: 355
     env:
       PYTHONUNBUFFERED: "1"
-      TG_TOKEN: ${{ secrets.TG_TOKEN_PERSONAL || secrets.TG_TOKEN }}
-      TG_CHAT: ${{ secrets.TG_CHAT_PERSONAL || secrets.TG_CHAT }}
-      WORKFLOW_FILE: record_personal.yml
-      LIVE_CARD: "1"
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+      WORKFLOW_FILE: record.yml
+      LIVE_CARD: "1"            # the live message is a picture dashboard (ring, speed graph, tiles); "0" = plain text
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
